@@ -1,173 +1,126 @@
-# ESP32 Unified Updater (BLE and WiFi)
+# Meshtastic ESP32 Ethernet + BLE Unified OTA Bootloader
 
-[![MemBrowse](https://membrowse.com/badge.svg)](https://membrowse.com/public/meshtastic/esp32-unified-ota)
+[![OTA Build](https://img.shields.io/badge/Build-PlatformIO%20%2F%20ESP--IDF-blue.svg)](https://platformio.org/)
+[![License](https://img.shields.io/badge/License-GPLv3-green.svg)](LICENSE)
 
-The is an AI-fueled fever dream mash-up of the the WiFi and BLE OTA updaters for ESP-32
+A specialized, lightweight recovery and update bootloader partition (`app1`) for Meshtastic ESP32 hardware, featuring **Wired Ethernet (W5500, DM9051, KSZ8851SNL)** as the primary update transport, paired with **Bluetooth Low Energy (NimBLE)** as an offline recovery fallback.
 
-- BLE Updater: https://github.com/meshtastic/firmware-ota
-- WiFi Updater: https://github.com/meshtastic/firmware-ota-wifi
-
-## Unified OTA Protocol Specification
-
-### 1. Overview
-
-  The protocol uses a text-based command-response handshake followed by a raw binary stream. It is designed for constrained devices, minimizing RAM usage by streaming data directly to flash memory.
-
-  Key Security Feature: The device strictly enforces firmware integrity. The SHA-256 hash of the intended firmware must be pre-provisioned in the device's Non-Volatile Storage (NVS) before the update begins. The client must provide this exact hash during the handshake, and the final downloaded binary must match it.
-
-  Meshtastic's design implicitly trusts the network.  This NVS hashing system is intended for future compatibility.  Should the firmware TCP connection be secured in some way, then the NVS hash can only be applied by a trusted device.  The OTA loader will then only accept a firmware with the proper hash.  
-
-  If there is a hash mismatch, the OTA loader will intentionally corrupt the header of the partition to prevent untrusted or bad code from executing.
-
-### 2. Transport Layers
-
-#### A. WiFi (TCP)
-*   **Discovery:** The device listens for UDP broadcasts on port `3232`. It responds with its device name and version.
-*   **Connection:** The Client initiates a TCP connection to the device IP on port `3232`.
-*   **Flow:** Synchronous. The client sends a packet and waits for a response (or TCP ACK).
-
-#### B. Bluetooth Low Energy (BLE)
-*   **Service UUID:** `4FAFC201-1FB5-459E-8FCC-C5C9C331914B`
-*   **Characteristics:**
-    *   **OTA (Write / Write No Response):** `62ec0272-3ec5-11eb-b378-0242ac130005`
-        *   Used by Client to send Commands and Binary Firmware.
-    *   **TX (Notify):** `62ec0272-3ec5-11eb-b378-0242ac130003`
-        *   Used by Device to send responses (`OK`, `ERR`, `ACK`, `ERASING`).
-*   **Flow:** Asynchronous with application-level ACK. The client writes a chunk, then waits for an `ACK` notification before sending the next.
+Forked from [`meshtastic/esp32-unified-ota`](https://github.com/meshtastic/esp32-unified-ota).
 
 ---
 
-### 3. Protocol Workflow
+## Why Ethernet OTA?
 
-#### Phase 1: Connection & Version Check
-1.  **Client** connects (TCP) or Subscribes to TX Characteristic (BLE).
-2.  **Client** sends: `VERSION\n`
-3.  **Device** responds: `OK <hw_ver> <fw_ver> <reboot_count> <git_hash>\n`
-    *   *Example:* `OK 1 1.0.0 45 v1.2-5-g8a2b3c`
-
-#### Phase 2: The Handshake (Start OTA)
-1.  **Client** sends: `OTA <size_in_bytes> <sha256_hex_string>\n`
-    *   *Example:* `OTA 1048576 a1b2c3d4...` (64 char hex string)
-2.  **Device** performs **Validation**:
-    *   Parses size and hash.
-    *   **Check:** Compares the Client-provided hash against the `ota_hash` stored in the device's NVS.
-3.  **Device** responds (on success):
-    *   Sends: `ERASING` (This indicates flash erasure has started. Client should wait).
-    *   *...Time passes (Flash Erase)...*
-    *   Sends: `OK\n` (Device is now ready to receive binary stream).
-4.  **Device** responds (on failure):
-    *   Sends: `ERR <Reason>\n` (e.g., `ERR Hash Rejected`, `ERR Invalid Format`).
-    *   The connection remains open, but OTA state is reset.
-
-#### Phase 3: Binary Streaming
-Once the `OK\n` is received after the OTA command, the device enters `STATE_DOWNLOADING`.
-
-1.  **Client** splits the firmware binary into chunks (Recommended: 256 to 512 bytes for BLE, up to 1024 for WiFi).
-2.  **Loop** until all bytes are sent:
-    *   **Client** sends binary chunk.
-    *   **Device** writes chunk to OTA partition and updates running SHA-256 calculation.
-    *   **(BLE ONLY) Device** sends: `ACK` via notification.
-    *   **(BLE ONLY) Client** waits for `ACK` before sending next chunk.
-    *   **(WiFi)** Standard TCP flow control applies; no application-level ACK is sent per chunk.
-
-#### Phase 4: Finalization & Verification
-1.  **Device** detects that `total_received_bytes == size_in_bytes`.
-2.  **Device** calculates the final SHA-256 hash of the written partition.
-3.  **Device** compares Calculated Hash vs. NVS Expected Hash.
-
-##### Scenario A: Success
-1.  **Device** sets the new partition as the Boot Partition.
-2.  **Device** resets internal reboot counters (if applicable).
-3.  **Device** sends: `OK\n`
-4.  **Device** waits 2 seconds, then reboots.
-
-##### Scenario B: Failure (Hash Mismatch)
-1.  **Device** detects mismatch.
-2.  **Device** executes **Partition Corruption**:
-    *   Overwrites the first sector of the target OTA partition with garbage data (`0xFF`).
-    *   This ensures the bootloader will **not** attempt to boot this corrupt firmware.
-3.  **Device** sends: `ERR Hash Mismatch\n`
-4.  **Device** aborts OTA and resets state.
+1. **Massive Flash Space Savings**:
+   * Stripping the closed-source Espressif Wi-Fi stack eliminates over **200 KB** of binary bloat.
+   * Total binary footprint is **~475 KB**, leaving **~180 KB of free headroom** under the 640 KB (`0x0A0000`) partition ceiling.
+2. **Zero NVS Credential Handshake Needed**:
+   * Unlike Wi-Fi, Ethernet requires no SSID or password to be passed through NVS. It acquires a network configuration via DHCP over the wire on boot.
+3. **Static IP & DHCP Support**:
+   * Supports dynamic DHCP acquisition or pre-configured Static IP (`ip`, `gw`, `netmask`, `dns`) read directly from the `"MeshtasticOTA"` NVS namespace.
+4. **Dual Transport Recovery (Ethernet + BLE)**:
+   * Listens on **TCP port 3232** for high-speed wired local updates.
+   * Concurrently exposes the Meshtastic BLE OTA GATT service. If the Ethernet cable is disconnected or DHCP times out, BLE is immediately ready for recovery updates.
+5. **Anti-Bricking Failsafe**:
+   * If neither Ethernet nor BLE establishes an active update session within the timeout window, the bootloader safely restores the boot pointer to `app0` (main Meshtastic firmware) and reboots.
 
 ---
 
-### 4. Command Reference
+## Supported Hardware & Pinouts
 
-All commands must be terminated with `\n` (newline).
+| Environment Target | Target Board / MCU | Ethernet Chip | MOSI | MISO | SCLK | CS | INT | RST | SPI Host |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `station-g3-waveshare-eth-ota` | **Station G3 + Waveshare ESP32-S3-ETH** | W5500 | 11 | 12 | 13 | 14 | 10 | 9 | `SPI3_HOST` |
+| `t-eth-elite-ota` | **LilyGO T-ETH-Elite** (ESP32-S3) | W5500 | 21 | 47 | 48 | 45 | 14 | -1 | `SPI3_HOST` |
+| `t-connect-pro-ota` | **LilyGO T-Connect-Pro** (ESP32-S3) | W5500 | 11 | 12 | 13 | 10 | 9 | 48 | `SPI3_HOST` |
+| `esp32s3-dm9051-ota` | **Generic ESP32-S3** | DM9051 | 11 | 12 | 13 | 14 | 10 | 9 | `SPI3_HOST` |
+| `esp32s3-ksz8851-ota` | **Generic ESP32-S3** | KSZ8851SNL | 11 | 12 | 13 | 14 | 10 | 9 | `SPI3_HOST` |
 
-| Command | Arguments | Description | Response Success | Response Fail |
-| :--- | :--- | :--- | :--- | :--- |
-| `VERSION` | None | Get device info | `OK <hw> <fw> <cnt> <ver>` | `ERR` |
-| `REBOOT` | None | Force restart | `OK` (then reboots) | `ERR` |
-| `OTA` | `<size> <hash>` | Start update | `ERASING` ... `OK` | `ERR <Msg>` |
+---
 
-### 5. Error Codes
+## Flash Partition Layout (16 MB Flash)
 
-If the device replies with `ERR`, the remainder of the line describes the error.
+Matches standard Meshtastic `default_16MB.csv`:
 
-*   `ERR Unknown Command`: The command string was not recognized.
-*   `ERR Invalid Format`: Arguments for `OTA` command were malformed.
-*   `ERR Hash Rejected (NVS Mismatch)`: The hash provided by the client does not match the hash pinned in the device NVS.
-*   `ERR No Partition`: Could not find a valid OTA_0 or OTA_1 partition.
-*   `ERR OTA Begin Failed`: Hardware error initializing flash write.
-*   `ERR Hash Update`: Internal crypto engine error.
-*   `ERR Flash Write`: Hardware error writing to flash.
-*   `ERR Size Mismatch`: Client sent more bytes than declared in `OTA` command.
-*   `ERR Hash Mismatch`: The downloaded binary did not match the expected hash.
-*   `ERR Set Boot`: Failed to configure bootloader to use new partition.
+```
++------------+------------+---------------+-----------------------------------------------+
+| Partition  | Offset     | Size          | Purpose                                       |
++------------+------------+---------------+-----------------------------------------------+
+| nvs        | 0x009000   | 0x005000 (20K)| NVS ("MeshtasticOTA" metadata & SHA-256 hash) |
+| otadata    | 0x00E000   | 0x002000 (8K) | Boot partition selector                       |
+| app0       | 0x010000   | 0x640000 (6MB)| Primary Meshtastic Firmware                   |
+| app1       | 0x650000   | 0x640000 (6MB)| Dedicated Ethernet+BLE OTA Recovery Loader    |
+| spiffs     | 0xC90000   | 0x360000(3.3M)| Web interface files                           |
++------------+------------+---------------+-----------------------------------------------+
+```
+
+---
 
 ## Building with PlatformIO
 
-- PlatformIO should build with an esp32 or esp32s3 environment.
+### Prerequisites
+* PlatformIO Core 6.2+
+* Python 3.10+
 
-  ```
-  pio run -e esp32s3 -t upload
-  ```
-  or
-  ```
-  pio run -e esp32 -t upload
-  ```
+### Build Targets
 
-- A custom `uplaod_command` in the ini file will upload only the OTA loader into the
-  proper partion.
+Build the bootloader binary for your board:
 
-## Building with esp-idf
+```powershell
+# Station G3 + Waveshare ESP32-S3-ETH
+pio run -e station-g3-waveshare-eth-ota
 
-- Install esp-idf and activate the environment
+# LilyGO T-ETH-Elite
+pio run -e t-eth-elite-ota
 
-- Clean build with the following commands:
-
-```
-rm sdkconfig
-rm -rf build
-idf.py set-target esp32s3
-idf.py build
+# LilyGO T-Connect-Pro
+pio run -e t-connect-pro-ota
 ```
 
-- Install it on a 4MB board:
+The resulting binary will be in `.pio/build/<environment>/firmware.bin`.
 
-  `esptool.py --port /dev/tty.usbmodem21101 write_flash 0x260000 ./build/OTA-WiFi.bin`
+---
 
-- Install it on a 8MB board:
+## Flashing to Hardware
 
-  `esptool.py --port /dev/tty.usbmodem21101 write_flash 0x5D0000 ./build/OTA-WiFi.bin`
-  
-- Install it on a 16MB board:
+Flash the generated `firmware.bin` directly to the `app1` (`ota_1`) partition:
 
-  `esptool.py --port /dev/tty.usbmodem21101 write_flash 0x650000 ./build/OTA-WiFi.bin`
+### 16 MB Boards (Station G3 / Waveshare ESP32-S3-ETH):
+```powershell
+esptool.py --chip esp32s3 -p COM_PORT write_flash 0x650000 .pio/build/station-g3-waveshare-eth-ota/firmware.bin
+```
 
+### 4 MB Boards:
+```powershell
+esptool.py -p COM_PORT write_flash 0x260000 .pio/build/<environment>/firmware.bin
+```
 
-## Using this during development
+---
 
-- Apply merge the changes in the firmware `meshtastic-ota` branch into your firmware
-  version of choice. 
+## Protocol Specification
 
-- Build and install this version on your device
+### 1. Network Discovery & Handshake (Ethernet TCP)
+* **UDP Broadcast**: Device broadcasts its presence on UDP port `3232` every 1 second:
+  `"<device_name> <version>"`
+* **TCP Connection**: Client connects to device IP on TCP port `3232`.
+* **Handshake**:
+  1. Client sends: `VERSION\n`
+  2. Device responds: `OK <hw_ver> <fw_ver> <reboot_count> <git_hash>\n`
+  3. Client sends: `OTA <size_in_bytes> <sha256_hex_string>\n`
+  4. Device validates SHA-256 against pre-stored NVS hash.
+  5. Device responds: `ERASING\n` then `OK\n`.
+  6. Client streams binary chunks (up to 1024 bytes per chunk).
+  7. On completion, device calculates final SHA-256 of the flashed partition:
+     * If valid: Device responds `OK\n`, sets `app0` as boot partition, and reboots.
+     * If invalid: Device corrupts the corrupt partition header, responds `ERR Hash Mismatch\n`, and aborts.
 
-- Buind and install this OTA firmware into the OTA_1 partition.  Be careful only
-  write the OTA_1 partition and not any of the supporting partitions.  The 
-  platformio.ini file has a custom update step to do this using esptool.py
+### 2. Bluetooth Low Energy (BLE Fallback)
+* **Service UUID**: `4FAFC201-1FB5-459E-8FCC-C5C9C331914B`
+* **OTA Characteristic (Write)**: `62ec0272-3ec5-11eb-b378-0242ac130005`
+* **TX Characteristic (Notify)**: `62ec0272-3ec5-11eb-b378-0242ac130003`
 
-- Build and install the `firmware-updates` branch of the iOS app
+---
 
-- Good luck
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0) — see [LICENSE](LICENSE) for details.

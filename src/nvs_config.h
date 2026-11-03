@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -8,6 +9,11 @@ typedef struct {
     char ssid[32];
     char psk[64];
     uint8_t ota_hash[32];
+    bool has_static_ip;
+    uint32_t static_ip;
+    uint32_t static_gw;
+    uint32_t static_mask;
+    uint32_t static_dns;
 } nvs_config_t;
 
 void nvs_init_custom(const char *nvs_namespace);

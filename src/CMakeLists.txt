@@ -1,6 +1,7 @@
 # Feature toggles (can be set from -D on the CMake command line)
 option(ENABLE_BLE_OTA  "Build BLE OTA support"  OFF)
 option(ENABLE_WIFI_OTA "Build WiFi OTA support" ON)
+option(ENABLE_ETH_OTA  "Build Ethernet OTA support" OFF)
 
 # Base sources/requirements (always needed)
 set(ota_srcs
@@ -16,10 +17,22 @@ set(ota_reqs
     spi_flash
 )
 
+# Network OTA shared logic
+if(ENABLE_WIFI_OTA OR ENABLE_ETH_OTA)
+    list(APPEND ota_srcs "net_ota.cpp")
+    list(APPEND ota_reqs esp_event esp_netif lwip mbedtls)
+endif()
+
 # WiFi OTA
 if(ENABLE_WIFI_OTA)
-    list(APPEND ota_srcs "wifi_app.cpp" "net_ota.cpp")
-    list(APPEND ota_reqs esp_wifi esp_event esp_netif esp_phy lwip mbedtls)
+    list(APPEND ota_srcs "wifi_app.cpp")
+    list(APPEND ota_reqs esp_wifi esp_phy)
+endif()
+
+# Ethernet OTA
+if(ENABLE_ETH_OTA)
+    list(APPEND ota_srcs "eth_app.cpp")
+    list(APPEND ota_reqs esp_eth driver)
 endif()
 
 # BLE OTA
@@ -38,4 +51,5 @@ idf_component_register(
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     $<$<BOOL:${ENABLE_WIFI_OTA}>:USE_WIFI_OTA>
     $<$<BOOL:${ENABLE_BLE_OTA}>:USE_BLE_OTA>
+    $<$<BOOL:${ENABLE_ETH_OTA}>:USE_ETH_OTA>
 )

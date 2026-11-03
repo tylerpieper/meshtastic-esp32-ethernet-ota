@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_mac.h"
+#include "esp_app_desc.h"
 #include "lwip/sockets.h"
 #include <cstring>
 #include "utils.h"
@@ -12,12 +13,15 @@
 #define OTA_PORT 3232
 #define BROADCAST_INTERVAL_SEC 1
 
-// File-scope statics — moved off the main task stack (3584 B per sdkconfig) to relieve
-// stack pressure that seem to cause a russian roulette of StackOverflow panics during WiFi OTA on
-// ESP32-S3 (issue #8). BLE OTA already does this with `static OtaProcessor otaProcessor;`
-// at file scope (see ble_ota.cpp:33) — this mirrors that convention. Per-connection state
-// (client_sock, client_addr, client_addr_len, fd_set, timeval) STAYS on the stack so it
-// resets cleanly for each new client. (In case there is a reconnect or something, just in case)
+#ifndef OTA_IDLE_TIMEOUT_SEC
+#define OTA_IDLE_TIMEOUT_SEC 120
+#endif
+
+#ifndef OTA_SOCKET_RECV_TIMEOUT_SEC
+#define OTA_SOCKET_RECV_TIMEOUT_SEC 30
+#endif
+
+// File-scope statics to keep main task stack usage low on ESP32-S3
 static int udp_sock = -1;
 static int listen_sock = -1;
 static struct sockaddr_in broadcast_addr;
@@ -56,19 +60,20 @@ void start_network_ota_process(const nvs_config_t *config) {
     if (bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) FAIL("TCP Bind failed");
     if (listen(listen_sock, 1) < 0) FAIL("TCP Listen failed");
 
-    INFO("Listening on TCP port %d", OTA_PORT);
+    INFO("Listening on TCP port %d (idle timeout: %ds)", OTA_PORT, OTA_IDLE_TIMEOUT_SEC);
 
-    // Set the expencted hash from the NVS
+    // Set the expected hash from NVS
     otaProcessor.setNvramExpectedHash(config->ota_hash);
     otaProcessor.setAckEnabled(true);
-    
+
     while (true) {
         int client_sock = -1;
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
+        uint32_t idle_seconds = 0;
 
         INFO("Waiting for client...");
-        
+
         while (client_sock < 0) {
             sendto(udp_sock, discovery_msg, strlen(discovery_msg), 0, (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
             fd_set readfds;
@@ -78,10 +83,24 @@ void start_network_ota_process(const nvs_config_t *config) {
             int activity = select(listen_sock + 1, &readfds, NULL, NULL, &tv);
             if (activity > 0 && FD_ISSET(listen_sock, &readfds)) {
                 client_sock = accept(listen_sock, (struct sockaddr *)&client_addr, &client_addr_len);
-                if (client_sock >= 0) INFO("Client connected from %s", inet_ntoa(client_addr.sin_addr));
+                if (client_sock >= 0) {
+                    INFO("Client connected from %s", inet_ntoa(client_addr.sin_addr));
+                }
+            } else {
+                idle_seconds += BROADCAST_INTERVAL_SEC;
+                if (!otaProcessor.isFlashErased() && idle_seconds >= OTA_IDLE_TIMEOUT_SEC) {
+                    WARN("No OTA client connected within %u seconds. Restoring app0 and rebooting...", (unsigned int)idle_seconds);
+                    try_restore_app0_boot_partition();
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    esp_restart();
+                }
             }
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
+
+        // Prevent a stalled TCP connection from blocking recv() forever
+        struct timeval rcv_timeout = { .tv_sec = OTA_SOCKET_RECV_TIMEOUT_SEC, .tv_usec = 0 };
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
 
         otaProcessor.reset();
         otaProcessor.setSender([client_sock](const char* data, size_t len) {
@@ -91,16 +110,21 @@ void start_network_ota_process(const nvs_config_t *config) {
         while (true) {
             int len = recv(client_sock, rx_buffer, sizeof(rx_buffer), 0);
             if (len <= 0) {
-                INFO("Client disconnected");
+                INFO("Client disconnected or timed out");
                 break;
             }
             otaProcessor.process(rx_buffer, len);
-            
-            // Check for reboot request inside the loop or after recv returns
-            // Note: process() is synchronous here.
+
             if (otaProcessor.isRebootRequired()) {
+                #ifdef USE_WIFI_OTA
+                if (config->ssid[0] != '\0') {
+                    INFO("Marking NVRAM as updated for WiFi recovery.");
+                    nvs_mark_updated();
+                }
+                #endif
                 INFO("Reboot flag detected. Restarting in 2 seconds...");
                 vTaskDelay(2000 / portTICK_PERIOD_MS); // Wait for ACK flush
+                closesocket(client_sock);
                 esp_restart();
             }
         }

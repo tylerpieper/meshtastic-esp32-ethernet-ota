@@ -16,9 +16,21 @@
 #define RESP_OK "OK\n"
 #define RESP_ERR "ERR\n"
 #define RESP_ERASING "ERASING\n"
-#define RESP_ACK "ACK\n" // No newline needed for BLE packets usually, but keeps it simple
+#define RESP_ACK "ACK\n"
 
-OtaProcessor::OtaProcessor() : _state(STATE_IDLE), _sender(nullptr), _reboot_required(false), _ack_enabled(false) {
+OtaProcessor::OtaProcessor()
+    : _state(STATE_IDLE),
+      _sender(nullptr),
+      _reboot_required(false),
+      _ack_enabled(false),
+      _flash_erased(false),
+      _has_nvs_hash(false),
+      _ota_handle(0),
+      _target_partition(nullptr),
+      _firmware_size(0),
+      _total_received(0),
+      _cmd_len(0) {
+    mbedtls_sha256_init(&_sha_ctx);
     reset();
 }
 
@@ -43,13 +55,21 @@ void OtaProcessor::reset() {
     cleanup(false);
     _state = STATE_IDLE;
     _reboot_required = false;
-    // Do not reset _ack_enabled here, it's a configuration setting
+    // Do not reset _ack_enabled or _flash_erased here
     _cmd_len = 0;
     memset(_cmd_buffer, 0, sizeof(_cmd_buffer));
 }
 
 bool OtaProcessor::isRebootRequired() const {
     return _reboot_required;
+}
+
+bool OtaProcessor::isFlashErased() const {
+    return _flash_erased;
+}
+
+bool OtaProcessor::isDownloading() const {
+    return _state == STATE_DOWNLOADING;
 }
 
 void OtaProcessor::cleanup(bool success) {
@@ -119,12 +139,15 @@ void OtaProcessor::handleVersion() {
     nvs_get_meshtastic_info(&reboot_counter, &hw_vendor, fw_rev, fw_rev_len);
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    
+
     // Append version + git hash
     sendResponse("OK %d %s %lu v%s\n", hw_vendor, fw_rev, (unsigned long)reboot_counter, app_desc->version);
 }
 
 void OtaProcessor::handleReboot() {
+    if (!_flash_erased) {
+        try_restore_app0_boot_partition();
+    }
     sendResponse(RESP_OK);
     INFO("Reboot command received");
     _reboot_required = true;
@@ -168,24 +191,23 @@ void OtaProcessor::handleOtaStart(const char* args) {
 
     _firmware_size = size;
     _target_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    
+
     if (!_target_partition) {
         sendResponse("ERR No Partition\n");
         return;
     }
 
+    // Lock boot partition to running OTA_1 before erasing OTA_0 (app0) so power loss mid-erase recovers to OTA_1
     const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_set_boot_partition(running); 
-
+    esp_ota_set_boot_partition(running);
+    _flash_erased = true;
 
     // 1. Notify Client that we are about to block
-    sendResponse(RESP_ERASING); 
-    // 2. Yield to FreeRTOS to ensure the "ERASING" packet 
-    // actually gets pushed to the BLE/TCP hardware buffer before we block the CPU.
-    vTaskDelay(50 / portTICK_PERIOD_MS); 
+    sendResponse(RESP_ERASING);
+    // 2. Yield to FreeRTOS to ensure the "ERASING" packet gets pushed before flash erase blocks CPU
+    vTaskDelay(50 / portTICK_PERIOD_MS);
 
     INFO("Starting OTA. Size: %u, Part: 0x%lx", (unsigned int)_firmware_size, _target_partition->address);
-
 
     if (esp_ota_begin(_target_partition, _firmware_size, &_ota_handle) != ESP_OK) {
         sendResponse("ERR OTA Begin Failed\n");
@@ -193,7 +215,7 @@ void OtaProcessor::handleOtaStart(const char* args) {
     }
 
     mbedtls_sha256_init(&_sha_ctx);
-    mbedtls_sha256_starts(&_sha_ctx, 0); 
+    mbedtls_sha256_starts(&_sha_ctx, 0);
 
     _state = STATE_DOWNLOADING;
     _total_received = 0;
@@ -230,8 +252,6 @@ void OtaProcessor::handleBinaryChunk(const uint8_t* data, size_t len) {
             endOta();
         }
     } else {
-        // NEW: Send ACK if configured (for BLE)
-        // Only send ACK if we aren't done yet. If we are done, endOta() sends OK.
         if (_ack_enabled) {
             sendResponse(RESP_ACK);
         }
@@ -241,16 +261,14 @@ void OtaProcessor::handleBinaryChunk(const uint8_t* data, size_t len) {
 void OtaProcessor::endOta() {
     uint8_t calculated_hash[32];
     mbedtls_sha256_finish(&_sha_ctx, calculated_hash);
-    
-    // Compare Calculated vs Expected (which we verified matches NVS in handleOtaStart)
+
     if (memcmp(calculated_hash, _expected_hash, 32) != 0) {
         corrupt_partition(_target_partition);
         INFO("Hash Mismatch");
         print_hash("Calc: ", calculated_hash);
         print_hash("Exp : ", _expected_hash);
         sendResponse("ERR Hash Mismatch\n");
-        // Do not use esp_ota_abort becasue we're not doing the flip/flop partition thing.
-        _ota_handle = 0; 
+        _ota_handle = 0;
         reset();
         return;
     }
@@ -270,6 +288,7 @@ void OtaProcessor::endOta() {
         return;
     }
 
+    _flash_erased = false;
     nvs_reset_meshtastic_counter();
     sendResponse(RESP_OK);
     INFO("OTA Success. Flagging reboot.");

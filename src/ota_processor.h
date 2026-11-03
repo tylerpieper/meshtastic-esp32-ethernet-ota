@@ -20,8 +20,10 @@ public:
     void process(const uint8_t* data, size_t len);
     void reset();
     bool isRebootRequired() const;
+    bool isFlashErased() const;
+    bool isDownloading() const;
 
-    // NEW: Enable explicit ACKs for binary chunks (For BLE flow control)
+    // Enable explicit ACKs for binary chunks (for BLE/TCP flow control)
     void setAckEnabled(bool enabled);
 
 private:
@@ -34,7 +36,8 @@ private:
     ota_sender_t _sender;
     bool _reboot_required;
     bool _ack_enabled;
-    
+    bool _flash_erased;
+
     uint8_t _nvs_expected_hash[32];
     bool _has_nvs_hash;
 

@@ -1,6 +1,6 @@
 #include "ble_ota.h"
 #include "common_log.h"
-#include "ota_processor.h" 
+#include "ota_processor.h"
 #include "nvs_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -16,9 +16,13 @@
 #define CHARACTERISTIC_TX_UUID "62ec0272-3ec5-11eb-b378-0242ac130003"
 #define CHARACTERISTIC_OTA_UUID "62ec0272-3ec5-11eb-b378-0242ac130005"
 
-// Buffer size: Enough to hold a few MTU packets. 
+// Buffer size: Enough to hold a few MTU packets.
 // MTU ~517. 4KB buffer provides enough slack for flash write latency.
-#define STREAM_BUFFER_SIZE 4096 
+#define STREAM_BUFFER_SIZE 4096
+
+#ifndef OTA_IDLE_TIMEOUT_SEC
+#define OTA_IDLE_TIMEOUT_SEC 120
+#endif
 
 static BLEServer *pServer = NULL;
 static BLECharacteristic *pTxCharacteristic;
@@ -36,10 +40,10 @@ class MyServerCallbacks : public BLEServerCallbacks {
         esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
         esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
 
-        pServer->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 400); 
-        
+        pServer->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 400);
+
         deviceConnected = true;
-        
+
         nvs_config_t config;
         nvs_read_config(&config);
         // Set the hash in the static otaProcessor instance
@@ -48,13 +52,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
         // Reset Processor and Buffer
         otaProcessor.reset();
         otaProcessor.setAckEnabled(true);
-        xStreamBufferReset(xStreamBuffer); 
-        
+        xStreamBufferReset(xStreamBuffer);
+
         otaProcessor.setSender([](const char* data, size_t len) {
             pTxCharacteristic->setValue((const uint8_t*)data, len);
             pTxCharacteristic->notify();
         });
-        
+
         INFO("BLE Client Connected");
     }
 
@@ -69,14 +73,9 @@ class otaCallback : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic, NimBLEConnInfo& connInfo) override {
         std::string rxData = pCharacteristic->getValue();
         if (rxData.length() > 0) {
-            // Non-blocking push to buffer. 
-            // If buffer is full, we drop data (wait time 0).
-            // Flow control relies on the Client not sending too fast.
             size_t bytesSent = xStreamBufferSend(xStreamBuffer, rxData.data(), rxData.length(), 0);
-            
+
             if (bytesSent != rxData.length()) {
-                // This log indicates the Swift delay is too short
-                // Using printf directly as this runs in BLE context, avoid heavy logging if possible
                 printf("E: StreamBuffer Full! Dropped %u bytes\n", (unsigned int)(rxData.length() - bytesSent));
             }
         }
@@ -92,62 +91,73 @@ void ble_ota_task(void *param) {
 
     vTaskDelay(500 / portTICK_PERIOD_MS);
 
-    uint32_t rebootCounter = 0; 
-    uint8_t hwven = 0; 
+    uint32_t rebootCounter = 0;
+    uint8_t hwven = 0;
     char fwrev[32] = {0};
     size_t fwrev_len = sizeof(fwrev);
     nvs_get_meshtastic_info(&rebootCounter, &hwven, fwrev, fwrev_len);
     INFO("BLE Init - FW: %s", fwrev);
-    
+
     const char *devName = getDeviceName();
     NimBLEDevice::init(std::string{devName});
-    NimBLEDevice::setMTU(517); 
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9); 
-    
+    NimBLEDevice::setMTU(517);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
-    
+
     NimBLEService *pService = pServer->createService(SERVICE_UUID);
     pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
     pOtaCharacteristic = pService->createCharacteristic(CHARACTERISTIC_OTA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     pOtaCharacteristic->setCallbacks(new otaCallback());
-    
+
     pService->start();
-    
+
     NimBLEAdvertising *pAdvertising = pServer->getAdvertising();
     pAdvertising->addServiceUUID(pService->getUUID());
     pAdvertising->start();
-    
-    INFO("BLE Advertising started.");
 
-    uint8_t rxBuffer[520]; // Temp buffer to read from StreamBuffer
+    INFO("BLE Advertising started (idle timeout: %ds).", OTA_IDLE_TIMEOUT_SEC);
 
-    while(1) {
+    uint8_t rxBuffer[520];
+    TickType_t lastActivityTick = xTaskGetTickCount();
+    const TickType_t idleTimeoutTicks = pdMS_TO_TICKS(OTA_IDLE_TIMEOUT_SEC * 1000);
+
+    while (1) {
         // 1. Process Incoming Data
-        // Wait up to 10ms for data. If data arrives, process it immediately.
-        // This effectively throttles the loop to the incoming data rate or idle rate.
         size_t receivedBytes = xStreamBufferReceive(xStreamBuffer, rxBuffer, sizeof(rxBuffer), 10 / portTICK_PERIOD_MS);
-        
+
         if (receivedBytes > 0) {
+            lastActivityTick = xTaskGetTickCount();
             otaProcessor.process(rxBuffer, receivedBytes);
         }
 
         // 2. Connection Maintenance
         if (!deviceConnected && oldDeviceConnected) {
-            // Just disconnected
-            vTaskDelay(500 / portTICK_PERIOD_MS); 
+            vTaskDelay(500 / portTICK_PERIOD_MS);
             pServer->startAdvertising();
             INFO("Restart advertising");
             oldDeviceConnected = deviceConnected;
+            lastActivityTick = xTaskGetTickCount();
         }
         if (deviceConnected && !oldDeviceConnected) {
             oldDeviceConnected = deviceConnected;
+            lastActivityTick = xTaskGetTickCount();
         }
 
         // 3. Check for Reboot Flag
         if (otaProcessor.isRebootRequired()) {
             INFO("Reboot flag detected. Restarting in 2 seconds...");
             vTaskDelay(2000 / portTICK_PERIOD_MS); // Allow time for BLE notification to flush
+            esp_restart();
+        }
+
+        // 4. Inactivity Failsafe (only if app0 has not been erased yet)
+        if (!otaProcessor.isFlashErased() && !otaProcessor.isDownloading() &&
+            (xTaskGetTickCount() - lastActivityTick) >= idleTimeoutTicks) {
+            WARN("BLE OTA idle timeout (%ds) reached. Restoring app0 and rebooting...", OTA_IDLE_TIMEOUT_SEC);
+            try_restore_app0_boot_partition();
+            vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
         }
 

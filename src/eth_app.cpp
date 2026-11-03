@@ -6,6 +6,7 @@
 #include "esp_eth.h"
 #include "esp_eth_mac_spi.h"
 #include "esp_eth_netif_glue.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "driver/gpio.h"
@@ -100,6 +101,31 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base, int32_t ev
     }
 }
 
+static void drive_cs_pin_high(int pin) {
+    if (pin < 0) return;
+    gpio_config_t io_conf = {};
+    io_conf.pin_bit_mask = (1ULL << pin);
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&io_conf);
+    gpio_set_level((gpio_num_t)pin, 1);
+}
+
+static void deselect_shared_spi_devices(void) {
+    drive_cs_pin_high(ETH_CS_PIN);
+#ifdef LORA_CS_PIN
+    drive_cs_pin_high(LORA_CS_PIN);
+#endif
+#ifdef TFT_CS_PIN
+    drive_cs_pin_high(TFT_CS_PIN);
+#endif
+#ifdef SD_CS_PIN
+    drive_cs_pin_high(SD_CS_PIN);
+#endif
+}
+
 static void hardware_reset_module(void) {
 #if (ETH_RST_PIN >= 0)
     gpio_config_t rst_gpio_cfg = {};
@@ -122,13 +148,14 @@ bool eth_connect(const nvs_config_t *config) {
     eth_event_group = xEventGroupCreate();
     s_is_connected = false;
 
-    // 1. Hardware reset pulse
+    // 1. Ensure CS lines on the SPI bus are deselected (HIGH) and pulse hardware reset
+    deselect_shared_spi_devices();
     hardware_reset_module();
 
     // 2. Install GPIO ISR handler service for INT pin
     gpio_install_isr_service(0);
 
-    // 3. Initialize SPI bus (SPI3_HOST)
+    // 3. Initialize SPI bus
     spi_bus_config_t buscfg = {};
     buscfg.mosi_io_num = ETH_MOSI_PIN;
     buscfg.miso_io_num = ETH_MISO_PIN;
@@ -136,14 +163,14 @@ bool eth_connect(const nvs_config_t *config) {
     buscfg.quadwp_io_num = -1;
     buscfg.quadhd_io_num = -1;
 
-    INFO("Initializing SPI%d (MOSI:%d, MISO:%d, SCLK:%d)...", 
+    INFO("Initializing SPI%d (MOSI:%d, MISO:%d, SCLK:%d)...",
          ETH_SPI_HOST + 1, ETH_MOSI_PIN, ETH_MISO_PIN, ETH_SCLK_PIN);
     ESP_ERROR_CHECK(spi_bus_initialize(ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     // 4. Configure SPI device
+    // Leave command_bits=0 and address_bits=0 so ESP-IDF's per-chip MAC driver
+    // (W5500=16/8, DM9051=1/7, KSZ8851SNL=variable) configures its required frame format.
     spi_device_interface_config_t devcfg = {};
-    devcfg.command_bits = 16;
-    devcfg.address_bits = 8;
     devcfg.mode = 0;
     devcfg.clock_speed_hz = ETH_SPI_CLOCK_MHZ * 1000 * 1000;
     devcfg.spics_io_num = ETH_CS_PIN;
@@ -154,7 +181,8 @@ bool eth_connect(const nvs_config_t *config) {
     esp_eth_phy_t *phy = NULL;
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
     eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.reset_gpio_num = ETH_RST_PIN;
+    // Hardware reset was already performed in hardware_reset_module()
+    phy_config.reset_gpio_num = -1;
 
 #if CONFIG_ETH_SPI_ETHERNET_W5500
     if (ETH_MODULE_TYPE == ETH_MODULE_W5500) {
@@ -187,24 +215,36 @@ bool eth_connect(const nvs_config_t *config) {
 #endif
 
     if (!mac || !phy) {
-        FAIL("Failed to create Ethernet MAC/PHY instance for module type %d", (int)ETH_MODULE_TYPE);
+        WARN("Failed to create Ethernet MAC/PHY instance for module type %d", (int)ETH_MODULE_TYPE);
         return false;
     }
 
     // 6. Install driver
     esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
+    if (esp_eth_driver_install(&eth_config, &eth_handle) != ESP_OK || !eth_handle) {
+        WARN("Failed to install Ethernet driver");
+        return false;
+    }
 
-    // 7. Attach to Netif
+    // 7. Program ESP32 Ethernet MAC into the external SPI Ethernet chip
+    // Matches Meshtastic firmware (ETH.begin / SharedBusEthernet::begin) so DHCP assigns the same IP lease.
+    uint8_t mac_addr[6] = {0};
+    if (esp_read_mac(mac_addr, ESP_MAC_ETH) == ESP_OK) {
+        ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mac_addr));
+        INFO("Ethernet MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    }
+
+    // 8. Attach to Netif
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     eth_netif = esp_netif_new(&netif_cfg);
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
 
-    // 8. Register Event Handlers
+    // 9. Register Event Handlers
     ESP_ERROR_CHECK(esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler, NULL, NULL));
 
-    // 9. Configure Static IP vs DHCP
+    // 10. Configure Static IP vs DHCP
     if (config && config->has_static_ip && config->static_ip != 0) {
         s_is_static = true;
         INFO("Applying Static IP configuration...");
@@ -231,14 +271,14 @@ bool eth_connect(const nvs_config_t *config) {
         ESP_ERROR_CHECK(esp_netif_dhcpc_start(eth_netif));
     }
 
-    // 10. Start Ethernet Driver
+    // 11. Start Ethernet Driver
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
     INFO("Waiting up to %d seconds for Ethernet network link & IP...", ETH_CONNECT_TIMEOUT_SEC);
-    EventBits_t bits = xEventGroupWaitBits(eth_event_group, 
-                                           BIT_CONNECTED, 
-                                           pdFALSE, 
-                                           pdFALSE, 
+    EventBits_t bits = xEventGroupWaitBits(eth_event_group,
+                                           BIT_CONNECTED,
+                                           pdFALSE,
+                                           pdFALSE,
                                            pdMS_TO_TICKS(ETH_CONNECT_TIMEOUT_SEC * 1000));
 
     if (bits & BIT_CONNECTED) {

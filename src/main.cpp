@@ -38,15 +38,19 @@ extern "C" void app_main(void) {
     esp_netif_init();
     esp_event_loop_create_default();
 
-    // Note: We keep the NVS namespace "MeshtasticOTA" constant so 
-    // configuration is shared between all firmware variants.
+    // Point boot partition back to app0 while in pre-erase standby so any reset,
+    // connection failure, or idle timeout cleanly returns to Meshtastic firmware.
+    // OtaProcessor::handleOtaStart() locks boot back to OTA_1 right before erasing app0.
+    try_restore_app0_boot_partition();
+
+    // Keep the NVS namespace "MeshtasticOTA" constant so configuration is shared
     nvs_init_custom("MeshtasticOTA");
-    
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
     INFO("\n\n//\\ E S H T /\\ S T / C\n\n");
-    printf("OTA Loader v%s (%s)\r\n", app_desc->version, app_desc->project_name); 
+    printf("OTA Loader v%s (%s)\r\n", app_desc->version, app_desc->project_name);
     printf("Compiled on: %s %s\r\n", app_desc->date, app_desc->time);
-    
+
     nvs_config_t config;
     nvs_read_config(&config);
 
@@ -64,9 +68,10 @@ extern "C" void app_main(void) {
     }
     #endif
 
-    // If WiFi is disabled but Ethernet is enabled, map WiFi requests to Ethernet
+    // Network clients request OTA_WIFI (2) or OTA_ETH (3). On Ethernet-enabled builds
+    // without Wi-Fi, route network OTA requests (and uninitialized method 0) to Ethernet.
     #if defined(USE_ETH_OTA) && !defined(USE_WIFI_OTA)
-    if (config.method == OTA_WIFI) {
+    if (config.method == OTA_WIFI || config.method == NO_REBOOT_OTA) {
         config.method = OTA_ETH;
     }
     #endif
@@ -74,26 +79,13 @@ extern "C" void app_main(void) {
     if (config.method == OTA_ETH) {
         #ifdef USE_ETH_OTA
         INFO("Mode: Ethernet OTA");
-        bool connected = eth_connect(&config);
-        if (connected) {
+        if (eth_connect(&config)) {
             start_network_ota_process(&config);
-            INFO("Marking NVRAM as updated.");
-            nvs_mark_updated();
-            INFO("Success. Rebooting.");
-            esp_restart();
         } else {
-            #ifdef USE_BLE_OTA
-            WARN("Ethernet connection failed or timed out. Falling back to BLE OTA...");
-            xTaskCreate(ble_ota_task, "ble_ota_task", 8192, NULL, 5, NULL);
-            #else
-            FAIL("Ethernet connection failed and BLE fallback is not compiled. Rebooting to main app.");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            const esp_partition_t *app0 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-            if (app0) {
-                esp_ota_set_boot_partition(app0);
-            }
+            WARN("Ethernet connection failed or timed out. Rebooting to main app (app0)...");
+            try_restore_app0_boot_partition();
+            vTaskDelay(pdMS_TO_TICKS(1000));
             esp_restart();
-            #endif
         }
         #else
         FAIL("Ethernet Mode requested but not compiled in.");
@@ -104,10 +96,6 @@ extern "C" void app_main(void) {
         INFO("Connecting to SSID: %s", config.ssid);
         wifi_connect(&config);
         start_network_ota_process(&config);
-        INFO("Marking NVRAM as updated.");
-        nvs_mark_updated();
-        INFO("Success. Rebooting.");
-        esp_restart();
         #else
         FAIL("WiFi Mode requested but not compiled in.");
         #endif

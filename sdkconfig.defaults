@@ -1,22 +1,21 @@
 # ---------------------------------------------------------------
-# Espressif IDF sdkconfig.defaults for Meshtastic ESP32 Unified OTA
+# Espressif IDF sdkconfig.defaults for Meshtastic ESP32 Ethernet + BLE OTA
 # ===============================================================
 # Goal: Minimize binary to <655360 bytes (OTA_1 partition limit)
 # Current optimizations:
 # - -Os + LTO + no asserts/paths/exceptions/RTTI
 # - Logging OFF
+# - SPI Ethernet enabled (W5500, DM9051, KSZ8851SNL), Wi-Fi disabled
 # - NimBLE minimal (1 conn, BLE peripheral/broadcaster only)
 # - LWIP IPv4-only, tiny buffers/sockets
 # - mbedTLS minimal (SHA256/AES only, no TLS/EC/HTTPS)
-# - No FS/ETH/GDB/Unity/HTTPD/SoftAP/WPA3/Mesh
+# - No FS/GDB/Unity/HTTPD/SoftAP/WPA3/Mesh
 # - Tiny FreeRTOS stacks/queues
-# - Test incrementally with `pio run --target size`
 # ---------------------------------------------------------------
 
 # ---------------------------------------------------------------
 # 1. Compiler & Linker Optimization (Aggressive Size)
 # ---------------------------------------------------------------
-# Optimize for size (-Os)
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_COMPILER_OPTIMIZATION_DEFAULT=n
 CONFIG_COMPILER_OPTIMIZATION_PERF=n
@@ -40,6 +39,9 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NONE=y
 CONFIG_COMPILER_LTO=y
 CONFIG_COMPILER_ORPHAN_SECTIONS_PLACE=y
 CONFIG_APP_RETRIEVE_LEN_ELF_SHA=0
+
+# 4MB flash size default (eliminates PlatformIO 2MB vs 4MB warning)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # ---------------------------------------------------------------
 # 2. Logging (Fully Disabled)
@@ -106,7 +108,7 @@ CONFIG_BT_NIMBLE_HID_SERVICE=n
 CONFIG_BT_NIMBLE_CRYPTO_STACK_MBEDTLS=y
 
 # ---------------------------------------------------------------
-# 4. Networking (LwIP - IPv4 Tiny STA Only)
+# 4. Networking (LwIP - IPv4 Tiny Only)
 # ---------------------------------------------------------------
 CONFIG_LWIP_IPV6=n
 
@@ -134,7 +136,6 @@ CONFIG_LWIP_STATS=n
 # ---------------------------------------------------------------
 # 5. mbedTLS / Crypto (SHA256/AES Only - No TLS/HTTPS/EC)
 # ---------------------------------------------------------------
-# Minimal: Keep for WiFi/OTA hash (linker strips unused TLS)
 CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_HARDWARE_AES=y
 CONFIG_MBEDTLS_HARDWARE_SHA=y
@@ -176,10 +177,6 @@ CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=n
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=0
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=0
 
-# Kill EC (all curves; WiFi AES-only ok)
-CONFIG_MBEDTLS_ECP_C=n
-CONFIG_MBEDTLS_ECDH_C=n
-CONFIG_MBEDTLS_ECDSA_C=n
 CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED=n
 CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED=n
 CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=n
@@ -195,30 +192,20 @@ CONFIG_MBEDTLS_ECP_DP_CURVE25519_ENABLED=n
 CONFIG_MBEDTLS_ECP_NIST_OPTIM=n
 CONFIG_MBEDTLS_ECDSA_DETERMINISTIC=n
 
-# ---------------------------------------------------------------
-# 5b. Disable TLS Pullers / Selects (ESP-TLS, ProtoComm, Extras)
-# ---------------------------------------------------------------
 CONFIG_MBEDTLS_TLS_DISABLED=y
 CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS=n
 CONFIG_MBEDTLS_SERVER_SSL_SESSION_TICKETS=n
 
-# No ESP-TLS (plain HTTP OTA if needed; linker strips HTTPS)
 CONFIG_ESP_TLS=n
 CONFIG_ESP_TLS_USING_MBEDTLS=n
 
-# ProtoComm: v0 only (insecure/no-TLS; GATT OTA direct for Meshtastic)
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0=y
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=n
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2=n
 CONFIG_PROTCOMM_ESP_BT=n
 
-# No TLS stubs/pulls
 CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS=n
 
-# Strip TLS/EC/X509 bloat (WiFi keeps AES/SHA only)
-CONFIG_MBEDTLS_ECP_C=n
-CONFIG_MBEDTLS_ECDH_C=n
-CONFIG_MBEDTLS_ECDSA_C=n
 CONFIG_MBEDTLS_PKCS7_C=n
 CONFIG_MBEDTLS_FS_IO=n
 CONFIG_MBEDTLS_HAVE_TIME=n
@@ -236,21 +223,17 @@ CONFIG_MBEDTLS_CCM_C=n
 # ---------------------------------------------------------------
 # 6. System / FreeRTOS (Minimal Kernel)
 # ---------------------------------------------------------------
-# Nano newlib (no float printf)
 CONFIG_NEWLIB_NANO_FORMAT=y
 
-# Panic: Reboot only (no GDB/decode)
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 CONFIG_ESP_SYSTEM_PANIC_GDBSTUB=n
 
-# Tiny stacks/queues (safe for OTA tasks)
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1024
 CONFIG_FREERTOS_ISR_STACKSIZE=1024
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=1024
 CONFIG_FREERTOS_MINIMAL_SHARED_STACK_SIZE=1024
 CONFIG_FREERTOS_TIMER_QUEUE_LENGTH=5
 
-# No IRAM bloat
 CONFIG_ESP_ROM_PRINT_IN_IRAM=n
 CONFIG_ESP_SYSTEM_IN_IRAM=n
 CONFIG_LIBC_MISC_IN_IRAM=n
@@ -258,9 +241,15 @@ CONFIG_LIBC_LOCKS_PLACE_IN_IRAM=n
 CONFIG_ESP_TIMER_IN_IRAM=n
 
 # ---------------------------------------------------------------
-# 7. WiFi / Project Specifics (STA-Only, WPA2)
+# 7. SPI Ethernet Enabled / Wi-Fi Disabled
 # ---------------------------------------------------------------
-# STA-only, no SoftAP/Mesh/WPA3/Enterprise
+CONFIG_ETH_ENABLED=y
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+CONFIG_ETH_SPI_ETHERNET_DM9051=y
+CONFIG_ETH_SPI_ETHERNET_KSZ8851SNL=y
+
+CONFIG_ESP_WIFI_ENABLED=n
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 CONFIG_ESP_WIFI_MESH_SUPPORT=n
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
@@ -268,18 +257,15 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
 CONFIG_ESP_WIFI_ENABLE_SAE_PK=n
 
-# PHY: NVS-only calibration
+# PHY: NVS-only calibration (for BLE radio)
 CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION=n
 CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=y
 
-# Partition tweaks
 CONFIG_PARTITION_TABLE_MD5=n
 
 # ---------------------------------------------------------------
 # 8. Component Disables (Dead Code Elimination)
 # ---------------------------------------------------------------
-# No ETH/GDB/FS/Unity/HTTPD/VFS extras
-CONFIG_ETH_ENABLED=n
 CONFIG_ESP_GDBSTUB_ENABLED=n
 CONFIG_FATFS_VOLUME_COUNT=0
 CONFIG_SPIFFS_MAX_PARTITIONS=0
@@ -305,7 +291,6 @@ CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 CONFIG_LIBC_PICOLIBC=y
 CONFIG_LIBC_NEWLIB=n
 
-# Thread Matter Zigbee
 CONFIG_OPENTHREAD_ENABLED=n
 CONFIG_ZB_ENABLED=n
 CONFIG_IEEE802154_ENABLED=n

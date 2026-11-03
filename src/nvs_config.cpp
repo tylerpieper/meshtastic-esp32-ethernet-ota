@@ -23,11 +23,32 @@ void nvs_read_config(nvs_config_t *config) {
     config->method = 0; 
     memset(config->ssid, 0, 32);
     memset(config->psk, 0, 64);
+    config->has_static_ip = false;
+    config->static_ip = 0;
+    config->static_gw = 0;
+    config->static_mask = 0;
+    config->static_dns = 0;
 
-    if(nvs_get_u8(s_nvs_handle, "method", &config->method) != ESP_OK) INFO("No method found");
+    if (nvs_get_u8(s_nvs_handle, "method", &config->method) != ESP_OK) {
+        INFO("No method found");
+    }
     nvs_get_str(s_nvs_handle, "ssid", config->ssid, &ssid_len);
     nvs_get_str(s_nvs_handle, "psk", config->psk, &psk_len);
     nvs_get_blob(s_nvs_handle, "ota_hash", config->ota_hash, &hash_len);
+
+    // Read static IP settings if configured
+    if (nvs_get_u32(s_nvs_handle, "static_ip", &config->static_ip) == ESP_OK && config->static_ip != 0) {
+        config->has_static_ip = true;
+        nvs_get_u32(s_nvs_handle, "static_gw", &config->static_gw);
+        nvs_get_u32(s_nvs_handle, "static_mask", &config->static_mask);
+        nvs_get_u32(s_nvs_handle, "static_dns", &config->static_dns);
+    } else if (nvs_get_u32(s_nvs_handle, "ip", &config->static_ip) == ESP_OK && config->static_ip != 0) {
+        config->has_static_ip = true;
+        nvs_get_u32(s_nvs_handle, "gateway", &config->static_gw);
+        nvs_get_u32(s_nvs_handle, "subnet", &config->static_mask);
+        nvs_get_u32(s_nvs_handle, "dns", &config->static_dns);
+    }
+
     nvs_set_u8(s_nvs_handle, "updated", 0);
     nvs_commit(s_nvs_handle);
 }

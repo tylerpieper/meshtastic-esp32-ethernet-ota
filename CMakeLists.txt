@@ -6,15 +6,16 @@ file(STRINGS "version.txt" PROJECT_VER)
 # ------------------------------------------------------------------------------
 # 1. Determine Project Name & Validate Configuration
 # ------------------------------------------------------------------------------
-if(ENABLE_BLE_OTA AND ENABLE_WIFI_OTA)
+if(ENABLE_BLE_OTA AND (ENABLE_WIFI_OTA OR ENABLE_ETH_OTA))
     set(OTA_PROJECT_NAME "MeshtasticOTA")
 elseif(ENABLE_BLE_OTA)
     set(OTA_PROJECT_NAME "MeshtasticOTA-BLE")
 elseif(ENABLE_WIFI_OTA)
     set(OTA_PROJECT_NAME "MeshtasticOTA-WiFi")
+elseif(ENABLE_ETH_OTA)
+    set(OTA_PROJECT_NAME "MeshtasticOTA")
 else()
-    # Condition 4: Both OFF -> Fail compilation
-    message(FATAL_ERROR "Configuration Error: You must enable at least one OTA method (ENABLE_BLE_OTA=ON or ENABLE_WIFI_OTA=ON).")
+    message(FATAL_ERROR "Configuration Error: You must enable at least one OTA method (ENABLE_BLE_OTA=ON, ENABLE_WIFI_OTA=ON, or ENABLE_ETH_OTA=ON).")
 endif()
 
 # ------------------------------------------------------------------------------

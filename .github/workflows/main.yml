@@ -1,4 +1,4 @@
-name: CI
+name: CI & Upstream Sync
 
 on:
   push:
@@ -13,32 +13,118 @@ on:
     paths-ignore:
       - "**.md"
 
+  schedule:
+    # Check upstream meshtastic/esp32-unified-ota every 6 hours
+    - cron: "15 */6 * * *"
+
   workflow_dispatch:
     inputs:
-      create_release:
-        description: Create release
+      force_release:
+        description: "Force build and publish/update GitHub release"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
-  version:
-    if: inputs.create_release == true
+  sync_and_version:
+    name: Sync Upstream & Check Version
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - id: version
-        run: |
-          VERSION=$(cat version.txt)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.check.outputs.version }}
+      commit_sha: ${{ steps.check.outputs.commit_sha }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Check upstream meshtastic/esp32-unified-ota and determine build/release state
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/meshtastic/esp32-unified-ota.git || true
+          git fetch upstream main --tags
+
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          UPDATED_FROM_UPSTREAM="false"
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            if ! git merge-base --is-ancestor upstream/main HEAD; then
+              echo "New commits detected in upstream/main ($UPSTREAM_SHA)! Attempting automatic merge..."
+              if git merge upstream/main --no-commit --no-ff; then
+                echo "Merge succeeded cleanly."
+              else
+                echo "Merge reported conflicts; preserving fork workflow and README if conflicted..."
+                git checkout --ours .github/workflows/main.yml README.md 2>/dev/null || true
+                git add .github/workflows/main.yml README.md 2>/dev/null || true
+              fi
+
+              UNMERGED=$(git diff --name-only --diff-filter=U)
+              if [ -n "$UNMERGED" ]; then
+                echo "::error::Automatic merge from upstream/main failed due to conflicts in: $UNMERGED"
+                git merge --abort || true
+                gh issue create \
+                  --title "Upstream sync conflict with meshtastic/esp32-unified-ota ($UPSTREAM_SHA)" \
+                  --body "Automated merge from \`meshtastic/esp32-unified-ota@main\` (\`$UPSTREAM_SHA\`) encountered conflicts in:\n\`\`\`\n$UNMERGED\n\`\`\`\nPlease resolve manually." || true
+                exit 1
+              else
+                git commit -m "chore: sync upstream meshtastic/esp32-unified-ota ($UPSTREAM_SHA)"
+                git submodule update --init --recursive
+                git push origin HEAD:main
+                UPDATED_FROM_UPSTREAM="true"
+              fi
+            else
+              echo "Already up to date with upstream/main ($UPSTREAM_SHA)."
+            fi
+          fi
+
+          VERSION=$(tr -d '[:space:]' < version.txt)
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+          # Determine if a release for v$VERSION already exists
+          RELEASE_EXISTS="false"
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            RELEASE_EXISTS="true"
+          fi
+
+          SHOULD_BUILD="false"
+          SHOULD_RELEASE="false"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SHOULD_BUILD="true"
+            SHOULD_RELEASE="false"
+          elif [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHOULD_BUILD="true"
+            SHOULD_RELEASE="true"
+          elif [ "$UPDATED_FROM_UPSTREAM" = "true" ] || [ "$RELEASE_EXISTS" = "false" ]; then
+            SHOULD_BUILD="true"
+            SHOULD_RELEASE="true"
+          fi
+
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "Summary: version=v$VERSION, commit=$COMMIT_SHA, upstream=$UPSTREAM_SHA, should_build=$SHOULD_BUILD, should_release=$SHOULD_RELEASE"
 
   build:
     name: build (${{ matrix.pio_env }})
+    needs: sync_and_version
+    if: needs.sync_and_version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -52,6 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
           submodules: recursive
 
       - name: Setup Python
@@ -69,31 +156,69 @@ jobs:
         run: pio run -e $PIO_ENV
 
       - name: Rename firmware binary
-        run: mv .pio/build/${{ matrix.pio_env }}/firmware.bin .pio/build/mt-${{ matrix.pio_env }}.bin
+        run: |
+          cp -f .pio/build/${{ matrix.pio_env }}/firmware.bin .pio/build/mt-${{ matrix.pio_env }}.bin
+          if [ "${{ matrix.pio_env }}" = "station-g3-waveshare-eth-ota" ]; then
+            cp -f .pio/build/${{ matrix.pio_env }}/firmware.bin .pio/build/mt-esp32s3-ota.bin
+          fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.pio_env }}
-          path: .pio/build/mt-${{ matrix.pio_env }}.bin
+          path: |
+            .pio/build/mt-${{ matrix.pio_env }}.bin
+            .pio/build/mt-esp32s3-ota.bin
 
   release:
+    name: Publish GitHub Release
     runs-on: ubuntu-latest
-    if: inputs.create_release == true
-    needs: [version, build]
+    needs: [sync_and_version, build]
+    if: needs.sync_and_version.outputs.should_release == 'true'
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - name: Create release
+          path: release_assets
+
+      - name: Generate Checksums and Release Notes
+        working-directory: release_assets
+        run: |
+          sha256sum mt-*.bin > sha256sums.txt
+          cat sha256sums.txt
+
+          cat << 'EOF' > release_notes.md
+          ## Meshtastic ESP32 Ethernet + BLE Unified OTA Bootloader (`v${{ needs.sync_and_version.outputs.version }}`)
+
+          * **Repository Commit**: `${{ needs.sync_and_version.outputs.commit_sha }}`
+          * **Upstream (`meshtastic/esp32-unified-ota`) Base**: `${{ needs.sync_and_version.outputs.upstream_sha }}`
+
+          ### Included OTA Partition Binaries (`app1`)
+          | Binary Filename | Target Hardware | Ethernet Controller | Flash Offset (16MB) |
+          | :--- | :--- | :--- | :--- |
+          | `mt-station-g3-waveshare-eth-ota.bin` / `mt-esp32s3-ota.bin` | **Station G3 + Waveshare ESP32-S3-ETH** | W5500 (`SPI3_HOST`) | `0x650000` |
+          | `mt-t-eth-elite-ota.bin` | **LilyGO T-ETH-Elite** | W5500 (`SPI3_HOST`) | `0x650000` |
+          | `mt-t-connect-pro-ota.bin` | **LilyGO T-Connect-Pro** | W5500 (`SPI2_HOST`) | `0x650000` |
+          | `mt-esp32s3-dm9051-ota.bin` | **Generic ESP32-S3 DM9051** | DM9051 (`SPI3_HOST`) | `0x650000` |
+          | `mt-esp32s3-ksz8851-ota.bin` | **Generic ESP32-S3 KSZ8851SNL** | KSZ8851SNL (`SPI3_HOST`) | `0x650000` |
+
+          ### Manual Flashing to `app1` (`ota_1`)
+          ```bash
+          # For 16MB ESP32-S3 boards (e.g., Station G3 Waveshare ESP32-S3-ETH):
+          esptool.py --chip esp32s3 --port <PORT> write_flash 0x650000 mt-station-g3-waveshare-eth-ota.bin
+          ```
+          EOF
+
+      - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
-        id: create_release
         with:
           draft: false
           prerelease: false
-          name: Meshtastic ESP32 Ethernet OTA v${{ needs.version.outputs.version }}
-          generate_release_notes: true
-          tag_name: v${{ needs.version.outputs.version }}
+          make_latest: "true"
+          name: Meshtastic ESP32 Ethernet OTA v${{ needs.sync_and_version.outputs.version }}
+          tag_name: v${{ needs.sync_and_version.outputs.version }}
+          body_path: release_assets/release_notes.md
           files: |
-            mt-*-ota.bin
+            release_assets/mt-*.bin
+            release_assets/sha256sums.txt

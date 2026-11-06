@@ -226,13 +226,19 @@ bool eth_connect(const nvs_config_t *config) {
         return false;
     }
 
-    // 7. Program ESP32 Ethernet MAC into the external SPI Ethernet chip
-    // Matches Meshtastic firmware (ETH.begin / SharedBusEthernet::begin) so DHCP assigns the same IP lease.
+    // 7. Program ESP32 Ethernet MAC into the external SPI Ethernet chip.
+    // Matches Arduino-ESP32's ETH.cpp (ETHClass::begin) in Meshtastic firmware:
+    // With UNIVERSAL_MAC_ADDRESSES=2, esp_read_mac(ESP_MAC_ETH) adds 1 to byte 5 and sets bit 0x02.
+    // Arduino-ESP32 then calls esp_derive_local_mac() which flips bit 0x04 (0xba -> 0xbe), ensuring
+    // the OTA bootloader and main firmware use the exact same MAC and receive identical DHCP leases.
+    uint8_t base_mac_addr[6] = {0};
     uint8_t mac_addr[6] = {0};
-    if (esp_read_mac(mac_addr, ESP_MAC_ETH) == ESP_OK) {
-        ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mac_addr));
-        INFO("Ethernet MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    if (esp_read_mac(base_mac_addr, ESP_MAC_ETH) == ESP_OK) {
+        if (esp_derive_local_mac(mac_addr, base_mac_addr) == ESP_OK) {
+            ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mac_addr));
+            INFO("Ethernet MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        }
     }
 
     // 8. Attach to Netif

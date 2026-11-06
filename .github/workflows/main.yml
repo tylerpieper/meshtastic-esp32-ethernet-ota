@@ -125,7 +125,12 @@ jobs:
     name: build (${{ matrix.pio_env }})
     needs: sync_and_version
     if: needs.sync_and_version.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, meshtastic-builder]
+    env:
+      PYTHONPATH: /usr/local/lib/python3.12/dist-packages:/opt/pio-venv/lib/python3.12/site-packages
+      PLATFORMIO_SETTING_ENABLE_TELEMETRY: '0'
+      PLATFORMIO_SETTING_CHECK_PLATFORMIO_INTERVAL: '3650'
+      PLATFORMIO_SETTING_CHECK_PRUNE_SYSTEM_THRESHOLD: '10240'
     strategy:
       fail-fast: false
       matrix:
@@ -136,19 +141,13 @@ jobs:
           - pio_env: esp32s3-dm9051-ota
           - pio_env: esp32s3-ksz8851-ota
     steps:
+      - name: Clean workspace before build
+        run: rm -rf .pio release_assets
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
           submodules: recursive
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install Python Dependencies (PlatformIO)
-        run: pip install -r requirements.txt
 
       - name: Build ${{ matrix.pio_env }}
         env:
@@ -222,3 +221,16 @@ jobs:
           files: |
             release_assets/mt-*.bin
             release_assets/sha256sums.txt
+
+      - name: Trigger downstream build in station-g3-esp32-s3-eth
+        if: env.DISPATCH_TOKEN != ''
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          echo "Dispatching 'ethernet-ota-updated' event to tylerpieper/station-g3-esp32-s3-eth..."
+          curl -fL -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            https://api.github.com/repos/tylerpieper/station-g3-esp32-s3-eth/dispatches \
+            -d '{"event_type":"ethernet-ota-updated","client_payload":{"version":"${{ needs.sync_and_version.outputs.version }}","commit":"${{ needs.sync_and_version.outputs.commit_sha }}"}}'
+          echo "Dispatch event sent successfully!" 
